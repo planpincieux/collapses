@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 from joblib import Parallel, delayed
 from matplotlib import pyplot as plt
+from matplotlib.colors import Normalize
 from matplotlib.figure import Figure
 from shapely import contains_xy
 from shapely import wkt as shapely_wkt
@@ -20,6 +21,7 @@ from ppcollapse.utils.database import (
     fetch_dic_analysis_ids,
     get_collapses_df,
     get_dic_analysis_by_ids,
+    get_dic_data,
     get_image,
     get_multi_dic_data,
 )
@@ -35,7 +37,7 @@ logger = setup_logger(level="WARNING", name="ppcx")
 CONFIG_PATH: str | Path = "config.yaml"
 DAYS_BEFORE = 10
 OUTPUT_DIR = Path("output/collapses_timeseries")
-N_JOBS = 6  # number of parallel jobs
+N_JOBS = 1  # number of parallel jobs
 VELOCITY_YLIM = (0, 20)  # fixed y axis limits for velocity plot, or None
 # -------------------------
 
@@ -56,8 +58,18 @@ def fetch_dic_before(
     )
     if len(dic_ids) == 0:
         return pd.DataFrame(), {}
+
+    # get dic metadata and sort by date
     dic_metadata = get_dic_analysis_by_ids(dic_ids=dic_ids, db_engine=engine)
-    dic_data = get_multi_dic_data(dic_ids=dic_ids, config=config, stack_results=False)
+    dic_metadata["reference_date"] = pd.to_datetime(dic_metadata["reference_date"])
+    dic_metadata = dic_metadata.sort_values("reference_date").reset_index(drop=True)
+
+    # get dic data
+    dic_ids_sorted = dic_metadata["dic_id"].tolist()
+    dic_data = get_multi_dic_data(
+        dic_ids=dic_ids_sorted, config=config, stack_results=False
+    )
+
     return dic_metadata, dic_data
 
 
@@ -109,34 +121,131 @@ def compute_dic_stats_for_geom(
     return df
 
 
+def plot_geometry_on_image(ax, geom, image=None, **plot_kwargs):
+    """Plot Shapely geometry (Polygon or MultiPolygon) on matplotlib axis."""
+    if image is not None:
+        ax.imshow(image)
+
+    # Default plot styling
+    line_color = plot_kwargs.get("line_color", "red")
+    line_width = plot_kwargs.get("line_width", 2)
+    fill_color = plot_kwargs.get("fill_color", "red")
+    fill_alpha = plot_kwargs.get("fill_alpha", 0.3)
+
+    if geom.geom_type == "Polygon":
+        xs, ys = geom.exterior.xy
+        ax.plot(xs, ys, color=line_color, linewidth=line_width)
+        ax.fill(xs, ys, facecolor=fill_color, edgecolor="none", alpha=fill_alpha)
+    elif geom.geom_type == "MultiPolygon":
+        for poly in geom.geoms:
+            xs, ys = poly.exterior.xy
+            ax.plot(xs, ys, color=line_color, linewidth=line_width)
+            ax.fill(xs, ys, facecolor=fill_color, edgecolor="none", alpha=fill_alpha)
+    else:
+        raise ValueError(f"Unsupported geometry type: {geom.geom_type}")
+
+    ax.set_axis_off()
+    return ax
+
+
 def make_collapse_plot(
     stats_df: pd.DataFrame,
     collapse_row: pd.Series,
     image: np.ndarray,
     *,
+    stat_name: str = "mean",
     velocity_ylim: tuple[int, int] | None = VELOCITY_YLIM,
+    smooth_window: int = 3,  # rolling window size for smoothing
 ) -> tuple[Figure, Any]:
-    """Create the two-panel (image + timeseries) plot for a collapse and save it.
+    """Create the three-panel (image + quiver + timeseries) plot for a collapse.
 
     Returns the figure and axes objects.
     """
+
     collapse_id = int(collapse_row["id"])
-    geom = shapely_wkt.loads(collapse_row["geom_wkt"])
-    xs, ys = shapely_wkt.loads(shapely_wkt.dumps(geom)).exterior.xy
     date_ts = pd.to_datetime(collapse_row["date"])
 
-    fig, axes = plt.subplots(1, 2, figsize=(10, 6))
-    ax_img, ax_ts = axes
+    # Create figure with GridSpec for better control over spacing
+    fig = plt.figure(figsize=(16, 6))
+    gs = fig.add_gridspec(
+        1,
+        3,
+        width_ratios=[0.7, 0.75, 1],
+        hspace=0.02,
+        wspace=0.3,
+        left=0.01,
+        right=0.99,
+        top=0.92,
+        bottom=0.08,
+    )
+    ax_img = fig.add_subplot(gs[0])
+    ax_quiver = fig.add_subplot(gs[1])
+    ax_ts = fig.add_subplot(gs[2])
 
     # Left: image + geometry
-    ax_img.imshow(image)
-    ax_img.plot(xs, ys, color="red", linewidth=2)
-    ax_img.fill(xs, ys, facecolor="none", edgecolor="red", alpha=0.6)
+    geom = shapely_wkt.loads(collapse_row["geom_wkt"])
+    plot_geometry_on_image(
+        ax_img,
+        geom,
+        image=image,
+        line_color="red",
+        line_width=1.5,
+        fill_color="none",
+    )
     ax_img.set_axis_off()
+    ax_img.set_title("Collapse Geometry", fontsize=10, pad=5)
+
+    # Middle: quiver plot with proper implementation
+    has_quiver = False
+    if stats_df is not None and not stats_df.empty:
+        try:
+            # take second last, as last may be on collapse date
+            last_dic_id = stats_df.index[-2]
+            last_dic_date = stats_df.iloc[-2]["date"]
+            dic_pts = get_dic_data(
+                dic_id=last_dic_id,
+                config=ConfigManager(CONFIG_PATH),
+            )
+            ax_quiver.imshow(image, alpha=0.7)
+            mag_data = dic_pts["V"].to_numpy()
+            vmin = 0.0
+            vmax = np.percentile(mag_data, 95) if len(mag_data) > 0 else 1.0
+            norm = Normalize(vmin=vmin, vmax=vmax)
+            q = ax_quiver.quiver(
+                dic_pts["x"].to_numpy(),
+                dic_pts["y"].to_numpy(),
+                dic_pts["u"].to_numpy(),
+                dic_pts["v"].to_numpy(),
+                mag_data,
+                scale=None,
+                scale_units="xy",
+                angles="xy",
+                cmap="viridis",
+                norm=norm,
+                width=0.003,
+                headwidth=2.5,
+                alpha=1.0,
+            )
+            cbar = fig.colorbar(q, ax=ax_quiver, pad=0.01, fraction=0.046)
+            cbar.ax.tick_params(labelsize=8)
+            if pd.notna(last_dic_date):
+                date_str = pd.to_datetime(last_dic_date).strftime("%Y-%m-%d")
+                ax_quiver.set_title(
+                    f"DIC Velocity Field ({date_str})", fontsize=10, pad=5
+                )
+            has_quiver = True
+
+        except Exception as exc:
+            logger.warning(f"Could not plot quiver for collapse {collapse_id}: {exc}")
+
+    if not has_quiver:
+        ax_quiver.text(0.5, 0.5, "No DIC data available", ha="center", va="center")
+    ax_quiver.set_axis_off()
 
     # Right: timeseries
     if stats_df is None or stats_df.empty:
         ax_ts.text(0.5, 0.5, "No DIC data inside geometry", ha="center", va="center")
+        ax_ts.set_title("Velocity Time Series", fontsize=10, pad=5)
     else:
         stats = stats_df.copy()
         stats["date"] = pd.to_datetime(stats["date"])
@@ -144,31 +253,67 @@ def make_collapse_plot(
             if col in stats.columns:
                 stats[col] = pd.to_numeric(stats[col], errors="coerce")
         x = stats["date"]
-        if "std" in stats.columns and "mean" in stats.columns:
-            y1 = stats["mean"] - stats["std"]
-            y2 = stats["mean"] + stats["std"]
-            ax_ts.fill_between(x, y1, y2, color="gray", alpha=0.25, label="±1 std")
-        if "mean" in stats.columns:
-            ax_ts.plot(x, stats["mean"], marker="o", label="Mean")
-        if "median" in stats.columns:
-            ax_ts.plot(x, stats["median"], marker="", label="Median", linewidth=0.5)
+
+        # Plot std band
+        # if "std" in stats.columns and "mean" in stats.columns:
+        #     y1 = stats["mean"] - stats["std"]
+        #     y2 = stats["mean"] + stats["std"]
+        #     ax_ts.fill_between(x, y1, y2, color="gray", alpha=0.25, label="±1 std")
+
+        # Plot mean and median
+        if stat_name in stats.columns:
+            ax_ts.plot(
+                x,
+                stats[stat_name],
+                marker="o",
+                markersize=1,
+                label=stat_name.capitalize(),
+                linewidth=0,
+            )
+            # Plot smoothed mean using rolling average
+            if len(stats) >= smooth_window:
+                smoothed = (
+                    stats[stat_name]
+                    .rolling(window=smooth_window, center=True, min_periods=1)
+                    .mean()
+                )
+                ax_ts.plot(
+                    x,
+                    smoothed,
+                    label=f"Smoothed (window={smooth_window})",
+                    linewidth=2.5,
+                    color="C1",
+                    alpha=0.9,
+                )
 
         if velocity_ylim is not None and len(velocity_ylim) == 2:
             ax_ts.set_ylim(velocity_ylim)
-        ax_ts.set_xlabel("Date")
-        ax_ts.set_ylabel("Velocity [px/day]")
-        ax_ts.legend()
-        ax_ts.grid(alpha=0.3)
-        fig.autofmt_xdate()
 
+        ax_ts.set_xlabel("Date", fontsize=9)
+        ax_ts.set_ylabel("Velocity [px/day]", fontsize=9)
+        ax_ts.legend(fontsize=8, loc="best")
+        ax_ts.grid(alpha=0.3, linewidth=0.5)
+        ax_ts.tick_params(labelsize=8)
+        ax_ts.set_title("Velocity Inside Collapse Area", fontsize=10, pad=5)
+
+        # Format x-axis dates
+        for label in ax_ts.get_xticklabels():
+            label.set_rotation(30)
+            label.set_ha("right")
+
+    # Overall title
     area = collapse_row.get("area", float("nan"))
     volume = collapse_row.get("volume", float("nan"))
     fig.suptitle(
-        f"{date_ts.strftime('%Y-%m-%d')}\nArea {area:.1f} m², Volume {volume:.1f} m³\nCollapse ID {collapse_id}"
+        f"Collapse ID {collapse_id} — {date_ts.strftime('%Y-%m-%d')} — "
+        f"Area: {area:.1f} px² — Volume: {volume:.1f} m³",
+        fontsize=12,
     )
-    fig.tight_layout()
 
-    return fig, axes
+    fig.savefig(f"debug_{collapse_id}.jpg", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    return fig, (ax_img, ax_quiver, ax_ts)
 
 
 def process_collapse(
@@ -252,10 +397,6 @@ def process_collapse(
 
 def main() -> bool:
     cfg = ConfigManager(CONFIG_PATH)
-
-    # NOTE: TEMPORARY OVERRIDE DB NAME TO SANDBOX
-    cfg.set("database.name", "sandbox")
-    cfg.set("database.password", "postgresppcx")
 
     engine = create_engine(cfg.db_url)
     df = get_collapses_df(engine)

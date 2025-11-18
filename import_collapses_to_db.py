@@ -1,31 +1,34 @@
+import importlib
 from pathlib import Path
 
 import fiona
 import numpy as np
 import pandas as pd
+from django.contrib.gis.geos import GEOSGeometry
 from shapely import wkt as shapely_wkt
 from shapely.geometry import shape
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import transform
-from sqlalchemy import create_engine, text
 from tqdm import tqdm
 
 from ppcollapse import logger
 from ppcollapse.utils.config import ConfigManager
-from ppcollapse.utils.database import (
-    fetch_image_ids,
-    fetch_image_metadata_by_ids,
-)
-
-# Load configuration
-config = ConfigManager(config_path="config.yaml")
-db_engine = create_engine(
-    "postgresql://postgres:postgresppcx@150.145.51.193:5434/sandbox"
-)
+from setup_django_ppcx import get_django_app_dir, setup_django
 
 shape_dir = Path("data/SHAPEFILES_adj")
 file_ext = ".shp"
 volume_file_dir = Path("data/crolli")
+
+# Load configuration
+config = ConfigManager(config_path="config.yaml")
+
+# Configure Django settings before any Django imports
+setup_django(django_app_dir=get_django_app_dir(), db_config=config.get("database"))
+
+# Import Django models after setting up Django using importlib
+ppcx_app_models = importlib.import_module("ppcx_app.models")
+Collapse = ppcx_app_models.Collapse
+Image = ppcx_app_models.Image
 
 
 def read_shapely_geom_from_file(path: Path, invert_y: bool = False) -> BaseGeometry:
@@ -46,45 +49,34 @@ def read_shapely_geom_from_file(path: Path, invert_y: bool = False) -> BaseGeome
     return geom
 
 
-def write_geom_wkt_to_db(
-    db_engine,
-    image_id: int,
+def shapely_to_django_polygon(geom: BaseGeometry) -> GEOSGeometry:
+    """Convert Shapely geometry to Django GEOSGeometry Polygon with SRID=0."""
+    wkt = shapely_wkt.dumps(geom)
+    # Create Django Polygon from WKT with SRID=0 (image coordinates)
+    django_geom = GEOSGeometry(wkt, srid=0)
+    return django_geom
+
+
+def create_collapse_from_geom(
+    image: Image,
     geom: BaseGeometry,
     area: float | None = None,
     volume: float | None = None,
-    table: str = "ppcx_app_collapse",
-) -> int:
-    """Ensure minimal table exists and insert geometry as WKT (SRID=0). Returns inserted id."""
-    wkt = shapely_wkt.dumps(geom)
+) -> Collapse:
+    """Create a Collapse instance using Django ORM. Returns created Collapse instance."""
+    # Convert Shapely geometry to Django GEOSGeometry
+    django_geom = shapely_to_django_polygon(geom)
 
-    create_table_sql = f"""
-    CREATE TABLE IF NOT EXISTS {table} (
-        id SERIAL PRIMARY KEY,
-        image_id INTEGER NOT NULL REFERENCES ppcx_app_image(id),
-        geom geometry(Geometry,0),
-        area DOUBLE PRECISION,
-        volume DOUBLE PRECISION,
-        created_at TIMESTAMPTZ DEFAULT now()
-    );
-    """
+    # Create Collapse instance
+    collapse = Collapse(
+        image=image,
+        geom=django_geom,
+        area=float(area) if area is not None else None,
+        volume=float(volume) if volume is not None else None,
+    )
+    collapse.save()
 
-    insert_sql = f"""
-    INSERT INTO {table} (image_id, geom, area, volume)
-    VALUES (:image_id, ST_GeomFromText(:wkt, 0), :area, :volume)
-    RETURNING id;
-    """
-    with db_engine.begin() as conn:
-        conn.execute(text(create_table_sql))
-        res = conn.execute(
-            text(insert_sql),
-            {
-                "image_id": int(image_id),
-                "wkt": wkt,
-                "area": float(area) if area is not None else None,
-                "volume": float(volume) if volume is not None else None,
-            },
-        )
-        return res.scalar_one()
+    return collapse
 
 
 def read_collapse_volume_file(path: Path) -> pd.DataFrame:
@@ -144,6 +136,7 @@ if __name__ == "__main__":
         # Check if a volume file exists
         year = year_dir.name.split("_")[0]
         volume_file = volume_file_dir / f"crolli_{year}.txt"
+        collapse_volume_df = None
         if volume_file.exists():
             try:
                 collapse_volume_df = read_collapse_volume_file(volume_file)
@@ -181,26 +174,25 @@ if __name__ == "__main__":
                 ) from e
                 # continue
 
-            # Fetch image IDs for the given date, ordered by acquisition time descending
+            # Fetch images for the given date using Django ORM, ordered by acquisition time descending
             try:
-                image_ids = fetch_image_ids(
-                    db_engine,
-                    date=date.isoformat(),
-                    order_by="acquisition_timestamp DESC",
-                )
-                images_metadata = fetch_image_metadata_by_ids(
-                    db_engine=db_engine, image_id=image_ids
+                images = Image.objects.filter(
+                    acquisition_timestamp__date=date
+                ).order_by("-acquisition_timestamp")
+
+                if not images.exists():
+                    logger.warning(f"No images found for date {date}, skipping {file}")
+                    continue
+
+                # Pick up center image in the list
+                idx = len(images) // 2
+                image = images[idx]
+                logger.debug(
+                    f"Selected image ID: {image.id} - {image.acquisition_timestamp}"
                 )
             except Exception as e:
-                logger.error(f"Error fetching image IDs for {file}: {e}")
+                logger.error(f"Error fetching images for {file}: {e}")
                 continue
-
-            # Pick up center image in the list
-            idx = len(image_ids) // 2
-            image_id = image_ids[idx]
-            logger.debug(
-                f"Selected image ID: {image_id} - {images_metadata.iloc[idx].acquisition_timestamp}"
-            )
 
             # Read geometry from file
             try:
@@ -211,7 +203,7 @@ if __name__ == "__main__":
 
             # Get volume from collapse_volume_df if available
             volume = None
-            if has_volume_file:
+            if has_volume_file and collapse_volume_df is not None:
                 match = collapse_volume_df.loc[
                     (collapse_volume_df["date"].dt.date == date)
                 ]
@@ -221,35 +213,12 @@ if __name__ == "__main__":
                 else:
                     logger.debug(f"No volume entry found for date {date}")
 
-            # Insert geometry into DB and get id
+            # Insert geometry into DB using Django ORM
             area = np.round(geom.area, 5)
-            collapse_id = write_geom_wkt_to_db(
-                db_engine=db_engine,
-                image_id=image_id,
+            collapse = create_collapse_from_geom(
+                image=image,
                 geom=geom,
                 area=area,
                 volume=volume,
             )
-            logger.debug(f"Inserted collapse id: {collapse_id}")
-
-    # # TEST FETCHING DATA AND PLOTTING
-    # date = "2018-09-19"
-
-    # query = """
-    #     SELECT c.id, c.image_id, ST_AsText(c.geom) AS geom_wtk, area, volume
-    #     FROM ppcx_app_collapse c
-    #     JOIN ppcx_app_image img ON c.image_id = img.id
-    #     WHERE img.acquisition_timestamp::date = %s
-    # """
-    # df_read = pd.read_sql(query, db_engine, params=(date,))
-    # img = get_image(image_id=df_read["image_id"].values[0], config=config)
-
-    # fig, ax = plt.subplots(figsize=(8, 8))
-    # ax.imshow(img)
-    # colormap = plt.get_cmap("tab10")
-    # for i, g in enumerate(df_read["geom_wtk"]):
-    #     g = shapely_wkt.loads(g)
-    #     xs, ys = g.exterior.xy
-    #     ax.fill(xs, ys, facecolor="none", edgecolor=colormap(i), linewidth=2)
-    # ax.set_axis_off()
-    # plt.show()
+            logger.debug(f"Inserted collapse id: {collapse.id}")

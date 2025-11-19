@@ -484,6 +484,7 @@ def make_collapse_plot(
     *,
     velocity_ylim: tuple[int, int] | None = VELOCITY_YLIM,
     trend_method: str = ROBUST_METHOD,
+    idx_dic_before: int = -1,
 ) -> tuple[Figure, Any]:
     """Create the three-panel (image + quiver + timeseries) plot for a collapse.
 
@@ -526,8 +527,8 @@ def make_collapse_plot(
     # Middle: quiver plot with proper implementation
     try:
         # take second last, as last may be on collapse date
-        last_dic_id = dic_metadata.iloc[-2]["dic_id"]
-        last_dic_date = dic_metadata.iloc[-2]["reference_date"]
+        last_dic_id = dic_metadata.iloc[idx_dic_before]["dic_id"]
+        last_dic_date = dic_metadata.iloc[idx_dic_before]["reference_date"]
         dic_pts = get_dic_data(
             dic_id=last_dic_id,
             config=ConfigManager(CONFIG_PATH),
@@ -749,13 +750,11 @@ def process_collapse(
         image=np.asarray(image),
         velocity_ylim=VELOCITY_YLIM,
         trend_method=velocity_trend_method,
+        idx_dic_before=-1,
     )
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = (
-        out_dir
-        / f"{collapse_date.isoformat()}_collapse_{collapse_id}_timeseries{DAYS_BEFORE}days.jpg"
-    )
+    out_path = out_dir / f"collapse_{collapse_id}_{collapse_date.isoformat()}.jpg"
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     logger.debug(f"Saved plot for collapse {collapse_id} -> {out_path}")

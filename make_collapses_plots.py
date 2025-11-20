@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import pickle
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import matplotlib
 import numpy as np
@@ -33,6 +34,10 @@ from ppcollapse.utils.database import (
 matplotlib.use("Agg")
 
 logger = setup_logger(level="WARNING", name="ppcx")
+
+# Load .env file
+
+load_dotenv()
 
 # -------------------------
 # PARAMETERS (edit here)
@@ -660,6 +665,20 @@ def make_collapse_plot(
     return fig, (ax_img, ax_quiver, ax_ts)
 
 
+def _save_df(df: pd.DataFrame, base_path: Path, suffix: str) -> Path | None:
+    """Save DataFrame as Parquet (fallback to CSV)."""
+    if df is None or df.empty:
+        return None
+    parquet_path = base_path.with_name(base_path.name + f"_{suffix}.parquet")
+    csv_path = base_path.with_name(base_path.name + f"_{suffix}.csv")
+    try:
+        df.to_parquet(parquet_path, index=False)
+        return parquet_path
+    except Exception:
+        df.to_csv(csv_path, index=False)
+        return csv_path
+
+
 def process_collapse(
     collapse_row: pd.Series,
     cfg: ConfigManager,
@@ -667,7 +686,7 @@ def process_collapse(
     out_dir: Path,
     velocity_trend_method: str = ROBUST_METHOD,
     buffer_distance: float = BUFFER_DISTANCE_PX,
-) -> Optional[Path]:
+) -> bool:
     """
     Make the two-panel plot (image + geometry on left, velocity timeseries on right)
     for one collapse, reusing compute_dic_stats_for_geom and fetch_dic_before.
@@ -682,7 +701,7 @@ def process_collapse(
         geom = shapely_wkt.loads(collapse_row["geom_wkt"])
     except Exception as exc:
         logger.error(f"Invalid WKT for collapse {collapse_id}: {exc}")
-        return None
+        return False
 
     # fetch image
     image = None
@@ -690,7 +709,7 @@ def process_collapse(
         image = get_image(image_id=int(collapse_row["image_id"]), config=cfg)
     except Exception as exc:
         logger.error(f"Failed to fetch image for collapse {collapse_id}: {exc}")
-        return None
+        return False
 
     # fetch DIC data and compute stats inside geometry
     dic_metadata, dic_data = fetch_dic_before(
@@ -703,7 +722,7 @@ def process_collapse(
     )
     if dic_metadata.empty or not dic_data:
         logger.warning(f"No DIC data found before collapse {collapse_id}")
-        return None
+        return False
 
     # Compute statistics for collapse area and buffer
     stats_inside, stats_buffer = compute_stats_per_timestamp(
@@ -712,7 +731,7 @@ def process_collapse(
 
     if stats_inside.empty:
         logger.warning(f"No valid points inside geometry for collapse {collapse_id}")
-        return None
+        return False
 
     # Extract all points inside geometry
     all_points = []
@@ -753,13 +772,61 @@ def process_collapse(
         idx_dic_before=-1,
     )
 
+    # -------------------------------
+    # Save outputs
+    # -------------------------------
+    out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"collapse_{collapse_id}_{collapse_date.isoformat()}.jpg"
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    logger.debug(f"Saved plot for collapse {collapse_id} -> {out_path}")
 
-    return out_path
+    base_name = f"collapse_{collapse_id}_{collapse_date.isoformat()}"
+
+    plot_path = out_dir / f"{base_name}.jpg"
+    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    logger.debug(f"Saved plot for collapse {collapse_id} -> {plot_path}")
+
+    # Save dataframes individually
+    analysis_dir = out_dir / "analysis"
+    analysis_dir.mkdir(parents=True, exist_ok=True)
+    base_path = analysis_dir / base_name
+    inside_path = _save_df(stats_inside, base_path, "inside_stats")
+    buffer_path = _save_df(stats_buffer, base_path, "buffer_stats")
+    trend_path = _save_df(trend_fit, base_path, "trend_fit")
+    points_path = _save_df(df_all_points, base_path, "points")
+
+    # Aggregate dictionary (lightweight summary + paths)
+    summary = {
+        "collapse_id": collapse_id,
+        "date": collapse_date.isoformat(),
+        "geom_wkt": collapse_row.get("geom_wkt"),
+        "area": collapse_row.get("area"),
+        "volume": collapse_row.get("volume"),
+        "n_points_inside_total": int(df_all_points.shape[0]),
+        "file_plot": str(plot_path),
+        "file_stats_inside": str(inside_path) if inside_path else None,
+        "file_stats_buffer": str(buffer_path) if buffer_path else None,
+        "file_trend_fit": str(trend_path) if trend_path else None,
+        "file_points": str(points_path) if points_path else None,
+        "params": {
+            "MIN_VELOCITY": MIN_VELOCITY,
+            "OUTLIER_THRESHOLD": OUTLIER_THRESHOLD,
+            "BUFFER_DISTANCE_PX": buffer_distance,
+            "ROBUST_METHOD": velocity_trend_method,
+            "LOWESS_FRAC": LOWESS_FRAC,
+            "DAYS_BEFORE": days_before,
+        },
+    }
+    pickle_path = analysis_dir / f"{base_name}_summary.pkl"
+    try:
+        with open(pickle_path, "wb") as f:
+            pickle.dump(summary, f)
+        logger.debug(f"Saved summary pickle -> {pickle_path}")
+    except Exception:
+        logger.warning(
+            f"Failed to pickle summary for collapse {collapse_id}", exc_info=True
+        )
+
+    return True
 
 
 def main() -> bool:

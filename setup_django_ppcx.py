@@ -10,6 +10,8 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+from django.apps import apps as django_apps
+
 PPCX_APP_DIR = Path("/home/francesco/dati/ppcx/ppcx-app")
 
 
@@ -54,7 +56,7 @@ def setup_django(
     import django
 
     # Check if Django is already configured
-    if django.apps.apps.ready:
+    if django_apps.ready:
         raise RuntimeError(
             "Django is already configured. setup_django() should only be called once."
         )

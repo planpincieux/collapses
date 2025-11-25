@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import pickle
 from pathlib import Path
 from typing import Any
@@ -14,7 +15,6 @@ from matplotlib.figure import Figure
 from shapely import contains_xy
 from shapely import wkt as shapely_wkt
 from shapely.ops import unary_union
-from sklearn.linear_model import HuberRegressor, RANSACRegressor
 from sqlalchemy import create_engine
 from statsmodels.nonparametric.smoothers_lowess import lowess
 from tqdm import tqdm
@@ -35,30 +35,28 @@ matplotlib.use("Agg")
 
 logger = setup_logger(level="WARNING", name="ppcx")
 
-# Load .env file
-
-load_dotenv()
-
 # -------------------------
 # PARAMETERS (edit here)
 # -------------------------
 CONFIG_PATH: str | Path = "config.yaml"
-DAYS_BEFORE = 10
 OUTPUT_DIR = Path("output/collapses_timeseries")
-N_JOBS = 6  # number of parallel jobs
+
+MIN_COLLAPSE_AREA = 150000  # px²
+DAYS_BEFORE = 10
+DAY_AFTER = 5
+MIN_DIC_DAYS_BEFORE = 5  # Minimum number of DIC analyses before collapse
 
 MIN_VELOCITY = 1  # Minimum velocity threshold (px/day)
 OUTLIER_THRESHOLD = 2.5  # NMAD threshold for outlier removal
 BUFFER_DISTANCE_PX = 500  # Buffer ring distance in pixels, or None to disable
 
-ROBUST_METHOD = "lowess"  # Options: "lowess", "huber", "ransac"
-# ROBUST_METHOD = "lowess"  # Non-parametric, flexible (recommended)
-# ROBUST_METHOD = "huber"  # Linear, robust to outliers
-# ROBUST_METHOD = "ransac"  # Very robust, linear
+ROBUST_METHOD = "lowess"  # Only option supported for now.
 LOWESS_FRAC = 0.2
 # LOWESS_FRAC = 0.2  # More smoothing (larger window)
 # LOWESS_FRAC = 0.4  # Less smoothing (smaller window)
 VELOCITY_YLIM = (0, 20)  # fixed y axis limits for velocity plot, or None
+
+N_JOBS = 10  # number of parallel jobs
 
 # -------------------------
 
@@ -67,18 +65,32 @@ def nmad(x):
     return 1.4826 * np.median(np.abs(x - np.median(x)))
 
 
-def fetch_dic_before(
-    config: ConfigManager, collapse_date: str, days_before: int, **kwargs
+def fetch_dic_data(
+    config: ConfigManager,
+    collapse_date: str,
+    days_before: int | None = None,
+    day_after: int | None = None,
+    **kwargs,
 ):
     """Fetch DIC analyses in the window [collapse_date - days_before, collapse_date]."""
 
-    engine = create_engine(config.db_url)
+    if days_before is None:
+        days_before = 0
+
+    if day_after is None:
+        day_after = 0
+
     start_date = pd.to_datetime(collapse_date) - pd.Timedelta(days=days_before)
     start_date_str = start_date.strftime("%Y-%m-%d")
+
+    end_date = pd.to_datetime(collapse_date) + pd.Timedelta(days=day_after)
+    end_date_str = end_date.strftime("%Y-%m-%d")
+
+    engine = create_engine(config.db_url)
     dic_ids = fetch_dic_analysis_ids(
         db_engine=engine,
         reference_date_start=start_date_str,
-        reference_date_end=collapse_date,
+        reference_date_end=end_date_str,
         **kwargs,
     )
     if len(dic_ids) == 0:
@@ -171,71 +183,76 @@ def extract_and_filter_points(
     return pts
 
 
-def compute_stats_per_timestamp(
+def compute_stats_for_points(points: pd.DataFrame) -> dict[str, float]:
+    """
+    Compute velocity statistics for a set of points.
+
+    Args:
+        points: DataFrame with column 'V' (velocity)
+
+    Returns:
+        Dictionary with keys: n_points, mean, std, median, nmad
+    """
+    velocities = points["V"].to_numpy()
+    return {
+        "n_points": len(velocities),
+        "mean": np.mean(velocities),
+        "std": np.std(velocities),
+        "median": np.median(velocities),
+        "nmad": nmad(velocities),
+    }
+
+
+def compute_stats_timeseries(
     geom,
     dic_metadata: pd.DataFrame,
     dic_data: dict,
-    buffer_distance: float | None = None,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+    min_velocity: float = MIN_VELOCITY,
+    outlier_threshold: float = OUTLIER_THRESHOLD,
+) -> pd.DataFrame:
     """
-    Extract and compute statistics for points inside geometry and buffer ring.
+    Compute velocity statistics per timestamp for points inside geometry.
+
+    Args:
+        geom: Shapely geometry defining region
+        dic_metadata: DIC metadata DataFrame
+        dic_data: Dictionary mapping dic_id to point data
+        min_velocity: Minimum velocity threshold
+        outlier_threshold: NMAD threshold for outlier removal
 
     Returns:
-        stats_inside: DataFrame with stats for points inside collapse geometry
-        stats_buffer: DataFrame with stats for points in buffer ring (or empty if buffer_distance=None)
+        DataFrame with columns: date, n_points, mean, std, median, nmad
     """
-
-    def _compute_stats(array: np.ndarray) -> dict[str, Any]:
-        return {
-            "n_points": len(array),
-            "mean": np.mean(array),
-            "std": np.std(array),
-            "median": np.median(array),
-            "nmad": nmad(array),
-        }
-
-    # Create buffer if requested
-    buffered = None
-    if buffer_distance is not None and buffer_distance > 0:
-        # Normalize geometry for robust buffering
-        if geom.geom_type == "MultiPolygon":
-            base_geom = unary_union(list(geom.geoms))
-        else:
-            base_geom = geom
-
-        buffered = base_geom.buffer(buffer_distance)
-
-    rows_inside = []
-    rows_buffer = []
+    rows = []
 
     for dic_id in dic_metadata.dic_id.unique():
         pts = dic_data.get(dic_id)
         if pts is None or pts.empty:
             continue
 
-        date = pd.to_datetime(
+        date_val = pd.to_datetime(
             dic_metadata.loc[dic_metadata.dic_id == dic_id, "reference_date"].values[0]
         )
 
-        # Extract and filter points inside collapse
-        pts_inside = extract_and_filter_points(geom, pts)
-        if not pts_inside.empty:
-            rows_inside.append(
-                {"date": date, **_compute_stats(pts_inside["V"].to_numpy())}
-            )
+        # Extract and filter points
+        pts_filtered = extract_and_filter_points(
+            geom, pts, min_velocity=min_velocity, outlier_threshold=outlier_threshold
+        )
 
-        # Extract and filter points in buffer ring
-        if buffered is not None:
-            pts_buffer = extract_and_filter_points(buffered, pts)
-            if not pts_buffer.empty:
-                rows_buffer.append(
-                    {"date": date, **_compute_stats(pts_buffer["V"].to_numpy())}
-                )
+        if pts_filtered.empty:
+            continue
 
-    stats_inside = pd.DataFrame(rows_inside) if rows_inside else pd.DataFrame()
-    stats_buffer = pd.DataFrame(rows_buffer) if rows_buffer else pd.DataFrame()
+        # Compute statistics
+        stats = compute_stats_for_points(pts_filtered)
+        stats["date"] = date_val
+        rows.append(stats)
 
-    return stats_inside, stats_buffer
+    if not rows:
+        return pd.DataFrame(
+            columns=["date", "n_points", "mean", "std", "median", "nmad"]
+        )
+
+    return pd.DataFrame(rows).sort_values("date").reset_index(drop=True)
 
 
 def fit_robust_velocity_trend_lowess(
@@ -313,89 +330,6 @@ def fit_robust_velocity_trend_lowess(
     )
 
 
-def fit_robust_velocity_trend_huber(
-    df_points: pd.DataFrame, eval_dates: pd.DatetimeIndex | None = None
-) -> tuple[pd.Series, pd.Series]:
-    """
-    Fit Huber robust linear regression on ALL individual DIC points.
-
-    More resistant to outliers than ordinary least squares.
-    """
-    if df_points.empty or len(df_points) < 2:
-        return pd.Series(dtype=float), pd.Series(dtype=float)
-
-    df_sorted = df_points.sort_values("date").copy()
-    t_min = df_sorted["date"].min()
-    df_sorted["t_numeric"] = (df_sorted["date"] - t_min).dt.total_seconds() / (
-        24 * 3600
-    )
-
-    X = df_sorted["t_numeric"].values.reshape(-1, 1)
-    y = df_sorted["V"].values
-
-    # Fit Huber regressor
-    model = HuberRegressor(epsilon=1.35, max_iter=200)
-    model.fit(X, y)
-
-    # Predict at evaluation dates
-    if eval_dates is None:
-        eval_dates = pd.DatetimeIndex(df_sorted["date"].unique()).sort_values()
-
-    eval_t_numeric = (pd.Series(eval_dates) - t_min).dt.total_seconds() / (24 * 3600)
-    X_eval = eval_t_numeric.values.reshape(-1, 1)
-    predictions = model.predict(X_eval)
-
-    # Compute residuals and estimate std
-    residuals = y - model.predict(X)
-    pred_std = np.full(len(eval_dates), np.std(residuals))
-
-    return pd.Series(predictions, index=eval_dates), pd.Series(
-        pred_std, index=eval_dates
-    )
-
-
-def fit_robust_velocity_trend_ransac(
-    df_points: pd.DataFrame, eval_dates: pd.DatetimeIndex | None = None
-) -> tuple[pd.Series, pd.Series]:
-    """
-    Fit RANSAC robust linear regression on ALL individual DIC points.
-
-    Very resistant to outliers by randomly sampling consensus sets.
-    """
-    if df_points.empty or len(df_points) < 2:
-        return pd.Series(dtype=float), pd.Series(dtype=float)
-
-    df_sorted = df_points.sort_values("date").copy()
-    t_min = df_sorted["date"].min()
-    df_sorted["t_numeric"] = (df_sorted["date"] - t_min).dt.total_seconds() / (
-        24 * 3600
-    )
-
-    X = df_sorted["t_numeric"].values.reshape(-1, 1)
-    y = df_sorted["V"].values
-
-    # Fit RANSAC regressor
-    model = RANSACRegressor(random_state=42, max_trials=100)
-    model.fit(X, y)
-
-    # Predict at evaluation dates
-    if eval_dates is None:
-        eval_dates = pd.DatetimeIndex(df_sorted["date"].unique()).sort_values()
-
-    eval_t_numeric = (pd.Series(eval_dates) - t_min).dt.total_seconds() / (24 * 3600)
-    X_eval = eval_t_numeric.values.reshape(-1, 1)
-    predictions = model.predict(X_eval)
-
-    # Compute residuals on inliers only
-    inlier_mask = model.inlier_mask_
-    residuals = y[inlier_mask] - model.predict(X[inlier_mask])
-    pred_std = np.full(len(eval_dates), np.std(residuals))
-
-    return pd.Series(predictions, index=eval_dates), pd.Series(
-        pred_std, index=eval_dates
-    )
-
-
 def compute_robust_velocity_trend(
     df_points: pd.DataFrame,
     method: str = "lowess",
@@ -426,18 +360,8 @@ def compute_robust_velocity_trend(
             fitted_vel, std_vel = fit_robust_velocity_trend_lowess(
                 df_points, frac=frac, eval_dates=eval_dates
             )
-        elif method == "huber":
-            fitted_vel, std_vel = fit_robust_velocity_trend_huber(
-                df_points, eval_dates=eval_dates
-            )
-        elif method == "ransac":
-            fitted_vel, std_vel = fit_robust_velocity_trend_ransac(
-                df_points, eval_dates=eval_dates
-            )
         else:
-            raise ValueError(
-                f"Unknown method: {method}. Use 'lowess', 'huber', or 'ransac'"
-            )
+            raise ValueError(f"Unknown method: {method}. Use 'lowess'")
 
         trend_fit = pd.DataFrame(
             {
@@ -450,6 +374,172 @@ def compute_robust_velocity_trend(
 
     except Exception:
         return pd.DataFrame(columns=["date", "fitted_velocity", "std_velocity"])
+
+
+def _save_df(df: pd.DataFrame, base_path: Path, suffix: str) -> Path | None:
+    """Save DataFrame as Parquet (fallback to CSV)."""
+    if df is None or df.empty:
+        return None
+    parquet_path = base_path.with_name(base_path.name + f"_{suffix}.parquet")
+    csv_path = base_path.with_name(base_path.name + f"_{suffix}.csv")
+    try:
+        df.to_parquet(parquet_path, index=False)
+        return parquet_path
+    except Exception:
+        df.to_csv(csv_path, index=False)
+        return csv_path
+
+
+def _circular_mean(angles: np.ndarray) -> float:
+    """Return circular mean of angles in radians."""
+    if len(angles) == 0:
+        return np.nan
+    return math.atan2(np.mean(np.sin(angles)), np.mean(np.cos(angles)))
+
+
+def _circular_distance(a: float, b: float) -> float:
+    """Smallest absolute angular difference (radians) between two angles."""
+    if np.isnan(a) or np.isnan(b):
+        return np.nan
+    d = (a - b + math.pi) % (2 * math.pi) - math.pi
+    return abs(d)
+
+
+def compute_deviation_score(
+    pts_inside: pd.DataFrame,
+    pts_outside: pd.DataFrame,
+) -> dict[str, float]:
+    """
+    Compare velocity field between two point sets (magnitude + direction).
+
+    Score normalized to [0, 1] where:
+    - 0 = no difference
+    - 1 = maximum difference
+
+    Args:
+        pts_inside: DataFrame with columns [u, v, V]
+        pts_outside: DataFrame with columns [u, v, V]
+
+    Returns:
+        dict with keys: median_inside, median_outside, angle_inside, angle_outside, mag_diff_norm, angle_diff_norm, score
+    """
+    if pts_inside.empty or pts_outside.empty:
+        return {
+            "median_inside": np.nan,
+            "median_outside": np.nan,
+            "angle_inside": np.nan,
+            "angle_outside": np.nan,
+            "mag_diff_norm": np.nan,
+            "angle_diff_norm": np.nan,
+            "score": np.nan,
+        }
+
+    # Magnitudes
+    v_in = pts_inside["V"].to_numpy()
+    v_out = pts_outside["V"].to_numpy()
+    median_inside = np.median(v_in)
+    median_outside = np.median(v_out)
+
+    # Normalize magnitude difference: |diff| / (max + eps)
+    mag_diff = abs(median_inside - median_outside)
+    mag_max = max(median_inside, median_outside) + 1e-9
+    mag_diff_norm = mag_diff / mag_max  # [0, 1]
+
+    # Direction angles
+    u_in = pts_inside["u"].to_numpy()
+    v_in_vec = pts_inside["v"].to_numpy()
+    u_out = pts_outside["u"].to_numpy()
+    v_out_vec = pts_outside["v"].to_numpy()
+
+    angles_in = np.arctan2(v_in_vec, u_in)
+    angles_out = np.arctan2(v_out_vec, u_out)
+
+    angle_inside = _circular_mean(angles_in)
+    angle_outside = _circular_mean(angles_out)
+    angle_diff = _circular_distance(angle_inside, angle_outside)
+
+    # Normalize angle difference: angular_dist / pi → [0, 1]
+    angle_diff_norm = angle_diff / math.pi
+
+    # Combined score: mean of normalized components
+    score = (mag_diff_norm + angle_diff_norm) / 2.0  # [0, 1]
+
+    return {
+        "median_inside": median_inside,
+        "median_outside": median_outside,
+        "angle_inside": angle_inside,
+        "angle_outside": angle_outside,
+        "mag_diff_norm": mag_diff_norm,
+        "angle_diff_norm": angle_diff_norm,
+        "score": score,
+    }
+
+
+def compute_deviation_scores_timeseries(
+    geom_inside,
+    geom_outside,
+    dic_metadata: pd.DataFrame,
+    dic_data: dict,
+    min_velocity: float = MIN_VELOCITY,
+    outlier_threshold: float = OUTLIER_THRESHOLD,
+) -> pd.DataFrame:
+    """
+    Compute deviation scores per timestamp.
+
+    Args:
+        geom_inside: Shapely geometry for "inside" region
+        geom_outside: Shapely geometry for "outside" region
+        dic_metadata: DIC metadata DataFrame
+        dic_data: Dictionary mapping dic_id to point data
+
+    Returns:
+        DataFrame with columns: date, score, mag_diff_norm, angle_diff_norm, ...
+    """
+    rows = []
+
+    for dic_id in dic_metadata.dic_id.unique():
+        pts = dic_data.get(dic_id)
+        if pts is None or pts.empty:
+            continue
+
+        date_val = pd.to_datetime(
+            dic_metadata.loc[dic_metadata.dic_id == dic_id, "reference_date"].values[0]
+        )
+
+        # Extract and filter points
+        pts_inside = extract_and_filter_points(
+            geom_inside,
+            pts,
+            min_velocity=min_velocity,
+            outlier_threshold=outlier_threshold,
+        )
+        pts_outside = extract_and_filter_points(
+            geom_outside,
+            pts,
+            min_velocity=min_velocity,
+            outlier_threshold=outlier_threshold,
+        )
+
+        # Compute deviation score
+        dev_dict = compute_deviation_score(pts_inside, pts_outside)
+        dev_dict["date"] = date_val
+        rows.append(dev_dict)
+
+    if not rows:
+        return pd.DataFrame(
+            columns=[
+                "date",
+                "median_inside",
+                "median_outside",
+                "angle_inside",
+                "angle_outside",
+                "mag_diff_norm",
+                "angle_diff_norm",
+                "score",
+            ]
+        )
+
+    return pd.DataFrame(rows).sort_values("date").reset_index(drop=True)
 
 
 def plot_geometry_on_image(ax, geom, image=None, **plot_kwargs):
@@ -485,11 +575,13 @@ def make_collapse_plot(
     dic_points: pd.DataFrame,
     trend_fit: pd.DataFrame,
     stats_buffer: pd.DataFrame,
+    deviation_df: pd.DataFrame,
     image: np.ndarray,
     *,
     velocity_ylim: tuple[int, int] | None = VELOCITY_YLIM,
     trend_method: str = ROBUST_METHOD,
     idx_dic_before: int = -1,
+    deviation_score_before_collapse: float | None = None,
 ) -> tuple[Figure, Any]:
     """Create the three-panel (image + quiver + timeseries) plot for a collapse.
 
@@ -509,7 +601,7 @@ def make_collapse_plot(
         wspace=0.3,
         left=0.01,
         right=0.99,
-        top=0.92,
+        top=0.85,
         bottom=0.08,
     )
     ax_img = fig.add_subplot(gs[0])
@@ -630,6 +722,34 @@ def make_collapse_plot(
                 label="±1 std",
             )
 
+        # Deviation score on twin axis
+        if not deviation_df.empty:
+            ax_dev = ax_ts.twinx()
+            xd = pd.to_datetime(deviation_df["date"])
+            yd = deviation_df["score"]
+
+            ax_dev.plot(
+                xd,
+                yd,
+                color="tab:red",
+                linewidth=1.5,
+                marker="o",
+                markersize=3,
+                alpha=0.6,
+                label="Deviation score",
+            )
+            ax_dev.set_ylabel("Deviation score [0-1]", color="tab:red", fontsize=8)
+            ax_dev.tick_params(axis="y", labelsize=8, colors="tab:red")
+            ax_dev.set_ylim(0, 1)  # Normalized range
+
+            # Combine legends
+            lines1, labels1 = ax_ts.get_legend_handles_labels()
+            lines2, labels2 = ax_dev.get_legend_handles_labels()
+            ax_ts.legend(
+                lines1 + lines2, labels1 + labels2, fontsize=7, loc="best", ncol=1
+            )
+        else:
+            ax_ts.legend(fontsize=8, loc="best")
         if velocity_ylim is not None:
             ax_ts.set_ylim(velocity_ylim)
 
@@ -653,9 +773,15 @@ def make_collapse_plot(
     # Overall title
     area = collapse_row.get("area", float("nan"))
     volume = collapse_row.get("volume", float("nan"))
+    dev_text = (
+        f"Dev: {deviation_score_before_collapse:.3f}"
+        if deviation_score_before_collapse is not None
+        and not np.isnan(deviation_score_before_collapse)
+        else "Dev: n/a"
+    )
     fig.suptitle(
-        f"Collapse ID {collapse_id} — {date_ts.strftime('%Y-%m-%d')} — "
-        f"Area: {area:.1f} px² — Volume: {volume:.1f} m³ — ",
+        f"Collapse {collapse_id} — {date_ts.strftime('%Y-%m-%d')}\n"
+        f"Area: {area:.1f} px² — Volume: {volume:.1f} m³ — {dev_text}",
         fontsize=12,
     )
 
@@ -665,27 +791,15 @@ def make_collapse_plot(
     return fig, (ax_img, ax_quiver, ax_ts)
 
 
-def _save_df(df: pd.DataFrame, base_path: Path, suffix: str) -> Path | None:
-    """Save DataFrame as Parquet (fallback to CSV)."""
-    if df is None or df.empty:
-        return None
-    parquet_path = base_path.with_name(base_path.name + f"_{suffix}.parquet")
-    csv_path = base_path.with_name(base_path.name + f"_{suffix}.csv")
-    try:
-        df.to_parquet(parquet_path, index=False)
-        return parquet_path
-    except Exception:
-        df.to_csv(csv_path, index=False)
-        return csv_path
-
-
 def process_collapse(
     collapse_row: pd.Series,
     cfg: ConfigManager,
     days_before: int,
+    day_after: int,
     out_dir: Path,
     velocity_trend_method: str = ROBUST_METHOD,
     buffer_distance: float = BUFFER_DISTANCE_PX,
+    min_dic_days_before: int = 5,
 ) -> bool:
     """
     Make the two-panel plot (image + geometry on left, velocity timeseries on right)
@@ -712,10 +826,11 @@ def process_collapse(
         return False
 
     # fetch DIC data and compute stats inside geometry
-    dic_metadata, dic_data = fetch_dic_before(
+    dic_metadata, dic_data = fetch_dic_data(
         config=cfg,
         collapse_date=collapse_date.isoformat(),
         days_before=days_before,
+        day_after=day_after,
         camera_name="PPCX_Tele",
         dt_hours_min=72,
         dt_hours_max=96,
@@ -724,17 +839,50 @@ def process_collapse(
         logger.warning(f"No DIC data found before collapse {collapse_id}")
         return False
 
-    # Compute statistics for collapse area and buffer
-    stats_inside, stats_buffer = compute_stats_per_timestamp(
-        geom, dic_metadata, dic_data, buffer_distance=buffer_distance
-    )
+    if len(dic_metadata) < min_dic_days_before:
+        logger.warning(
+            f"Not enough DIC data before collapse {collapse_id} "
+            f"(found {len(dic_metadata)}, required {min_dic_days_before})"
+        )
+        return False
 
+    # Create geometries for analysis
+    geom_inside = geom
+    geom_outside = None
+
+    if buffer_distance is not None and buffer_distance > 0:
+        # Normalize geometry for robust buffering
+        if geom.geom_type == "MultiPolygon":
+            base_geom = unary_union(list(geom.geoms))
+        else:
+            base_geom = geom
+        geom_outside = base_geom.buffer(buffer_distance)
+
+    # Compute statistics for collapse area
+    stats_inside = compute_stats_timeseries(
+        geom_inside,
+        dic_metadata,
+        dic_data,
+        min_velocity=MIN_VELOCITY,
+        outlier_threshold=OUTLIER_THRESHOLD,
+    )
     if stats_inside.empty:
         logger.warning(f"No valid points inside geometry for collapse {collapse_id}")
         return False
 
-    # Extract all points inside geometry
-    all_points = []
+    # Compute statistics for buffer (if applicable)
+    stats_buffer = pd.DataFrame()
+    if geom_outside is not None:
+        stats_buffer = compute_stats_timeseries(
+            geom_outside,
+            dic_metadata,
+            dic_data,
+            min_velocity=MIN_VELOCITY,
+            outlier_threshold=OUTLIER_THRESHOLD,
+        )
+
+    # Compute robust velocity trend
+    all_inside_points = []
     for dic_id in dic_metadata.dic_id.unique():
         pts = dic_data.get(dic_id)
         if pts is None or pts.empty:
@@ -743,33 +891,60 @@ def process_collapse(
         pts_filtered = extract_and_filter_points(
             geom, pts, MIN_VELOCITY, OUTLIER_THRESHOLD
         )
-        if not pts_filtered.empty:
-            date = dic_metadata.loc[
-                dic_metadata.dic_id == dic_id, "reference_date"
-            ].values[0]
-            pts_filtered["date"] = pd.to_datetime(date)
-            all_points.append(pts_filtered)
+        if pts_filtered.empty:
+            continue
 
-    df_all_points = pd.concat(all_points, ignore_index=True)
+        # Use center date between slave and master images as timestamp
+        master_date = pd.to_datetime(
+            dic_metadata.loc[dic_metadata.dic_id == dic_id, "master_timestamp"].values[
+                0
+            ]
+        )
+        slave_date = pd.to_datetime(
+            dic_metadata.loc[dic_metadata.dic_id == dic_id, "slave_timestamp"].values[0]
+        )
+        date = master_date + (slave_date - master_date) / 2
+        pts_filtered["date"] = pd.to_datetime(date)
+        all_inside_points.append(pts_filtered)
 
-    # Compute robust velocity trend
+    all_inside_points = pd.concat(all_inside_points, ignore_index=True)
     trend_fit = compute_robust_velocity_trend(
-        df_all_points,
+        all_inside_points,
         method=velocity_trend_method,
         eval_dates=pd.DatetimeIndex(stats_inside["date"]),
     )
+
+    # Compute deviation scores timeseries
+    deviation_df = pd.DataFrame()
+    deviation_score_before = np.nan
+    if geom_outside is not None:
+        deviation_df = compute_deviation_scores_timeseries(
+            geom_inside=geom_inside,
+            geom_outside=geom_outside,
+            dic_metadata=dic_metadata,
+            dic_data=dic_data,
+            min_velocity=MIN_VELOCITY,
+            outlier_threshold=OUTLIER_THRESHOLD,
+        )
+
+        # Get deviation score from second-to-last timestamp (before collapse)
+        if not deviation_df.empty and len(deviation_df) >= 2:
+            deviation_score_before = float(deviation_df.iloc[-2]["score"])
+        elif not deviation_df.empty:
+            deviation_score_before = float(deviation_df.iloc[-1]["score"])
 
     # Generate plot
     fig, ax = make_collapse_plot(
         collapse_row=collapse_row,
         dic_metadata=dic_metadata,
-        dic_points=df_all_points,
+        dic_points=all_inside_points,
         trend_fit=trend_fit,
         stats_buffer=stats_buffer,
+        deviation_df=deviation_df,
         image=np.asarray(image),
         velocity_ylim=VELOCITY_YLIM,
         trend_method=velocity_trend_method,
-        idx_dic_before=-1,
+        deviation_score_before_collapse=deviation_score_before,
     )
 
     # -------------------------------
@@ -785,28 +960,32 @@ def process_collapse(
     plt.close(fig)
     logger.debug(f"Saved plot for collapse {collapse_id} -> {plot_path}")
 
-    # Save dataframes individually
+    # Save dataframes
     analysis_dir = out_dir / "analysis"
     analysis_dir.mkdir(parents=True, exist_ok=True)
     base_path = analysis_dir / base_name
+
     inside_path = _save_df(stats_inside, base_path, "inside_stats")
     buffer_path = _save_df(stats_buffer, base_path, "buffer_stats")
     trend_path = _save_df(trend_fit, base_path, "trend_fit")
-    points_path = _save_df(df_all_points, base_path, "points")
+    points_path = _save_df(all_inside_points, base_path, "points")
+    deviation_path = _save_df(deviation_df, base_path, "deviation")
 
-    # Aggregate dictionary (lightweight summary + paths)
+    # Save summary
     summary = {
         "collapse_id": collapse_id,
         "date": collapse_date.isoformat(),
         "geom_wkt": collapse_row.get("geom_wkt"),
         "area": collapse_row.get("area"),
         "volume": collapse_row.get("volume"),
-        "n_points_inside_total": int(df_all_points.shape[0]),
+        "n_points_inside_total": int(all_inside_points.shape[0]),
+        "deviation_score_before_collapse": deviation_score_before,
         "file_plot": str(plot_path),
         "file_stats_inside": str(inside_path) if inside_path else None,
         "file_stats_buffer": str(buffer_path) if buffer_path else None,
         "file_trend_fit": str(trend_path) if trend_path else None,
         "file_points": str(points_path) if points_path else None,
+        "file_deviation": str(deviation_path) if deviation_path else None,
         "params": {
             "MIN_VELOCITY": MIN_VELOCITY,
             "OUTLIER_THRESHOLD": OUTLIER_THRESHOLD,
@@ -829,14 +1008,19 @@ def process_collapse(
     return True
 
 
-def main() -> bool:
+if __name__ == "__main__":
+
     def _process_row(row):
         try:
             process_collapse(
                 row,
                 cfg=cfg,
                 days_before=DAYS_BEFORE,
+                day_after=DAY_AFTER,
                 out_dir=OUTPUT_DIR,
+                velocity_trend_method=ROBUST_METHOD,
+                buffer_distance=BUFFER_DISTANCE_PX,
+                min_dic_days_before=MIN_DIC_DAYS_BEFORE,
             )
         except Exception:
             logger.exception(
@@ -847,23 +1031,17 @@ def main() -> bool:
 
     engine = create_engine(cfg.db_url)
     df = get_collapses_df(engine)
-    if df.empty:
-        logger.warning("No collapses found in database.")
-        return False
 
-    df_sorted = df.sort_values("id").reset_index(drop=True)
+    # Filter by minimum area
+    df = df[df["area"] >= MIN_COLLAPSE_AREA].reset_index(drop=True)
+
+    # df_sorted = df.sort_values("id").reset_index(drop=True)
     with Parallel(n_jobs=N_JOBS, backend="threading") as parallel:
         parallel(
             delayed(_process_row)(row)
             for _, row in tqdm(
-                df_sorted.iterrows(),
-                total=df_sorted.shape[0],
+                df.iterrows(),
+                total=df.shape[0],
                 desc="Processing collapses",
             )
         )
-
-    return True
-
-
-if __name__ == "__main__":
-    main()

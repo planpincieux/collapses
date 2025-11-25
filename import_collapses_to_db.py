@@ -1,4 +1,5 @@
 import importlib
+import re
 from pathlib import Path
 
 import fiona
@@ -6,7 +7,7 @@ import numpy as np
 import pandas as pd
 from django.contrib.gis.geos import GEOSGeometry
 from shapely import wkt as shapely_wkt
-from shapely.geometry import shape
+from shapely.geometry import MultiPolygon, shape
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import transform
 from tqdm import tqdm
@@ -15,9 +16,8 @@ from ppcollapse import logger
 from ppcollapse.utils.config import ConfigManager
 from setup_django_ppcx import get_django_app_dir, setup_django
 
-shape_dir = Path("data/SHAPEFILES_adj")
+shape_dir = Path("data/import")
 file_ext = ".shp"
-volume_file_dir = Path("data/crolli")
 
 # Load configuration
 config = ConfigManager(config_path="config.yaml")
@@ -31,94 +31,126 @@ Collapse = ppcx_app_models.Collapse
 Image = ppcx_app_models.Image
 
 
-def read_shapely_geom_from_file(path: Path, invert_y: bool = False) -> BaseGeometry:
-    """Read first feature from a shapefile, flip Y (QGIS -> image coords), return (geom, area, perimeter)."""
+def read_all_geometries_from_file(path: Path, invert_y: bool = False) -> BaseGeometry:
+    """
+    Read ALL features from a shapefile and return as MultiPolygon.
+    Flips Y coordinates if invert_y=True (QGIS -> image coords).
+
+    Returns:
+        MultiPolygon containing all geometries from the file
+    """
     with fiona.open(path) as src:
-        polygons = [feature["geometry"] for feature in src]
-    if not polygons:
+        features = list(src)
+
+    if not features:
         raise ValueError(f"No features found in {path}")
-    poly = polygons[0]
-    geom = shape(poly)
+
+    polygons = []
+    for feature in features:
+        geom = shape(feature["geometry"])
+
+        # Ensure we're working with polygons
+        if geom.geom_type == "Polygon":
+            polygons.append(geom)
+        elif geom.geom_type == "MultiPolygon":
+            polygons.extend(list(geom.geoms))
+        else:
+            logger.warning(f"Skipping non-polygon geometry type: {geom.geom_type}")
+
+    if not polygons:
+        raise ValueError(f"No polygon geometries found in {path}")
+
+    # Create MultiPolygon from all polygons
+    multi_geom = MultiPolygon(polygons)
 
     if invert_y:
-        # Invert Y axis because the polygons were created in qgis
-        geom = transform(
-            lambda x, y, z=None: (x, -y) if z is None else (x, -y, z), geom
+        # Invert Y axis because the polygons were created in QGIS
+        multi_geom = transform(
+            lambda x, y, z=None: (x, -y) if z is None else (x, -y, z), multi_geom
         )
 
-    return geom
+    logger.debug(f"Read {len(polygons)} polygon(s) from {path.name}")
+    return multi_geom
 
 
-def shapely_to_django_polygon(geom: BaseGeometry) -> GEOSGeometry:
-    """Convert Shapely geometry to Django GEOSGeometry Polygon with SRID=0."""
+def shapely_to_django_multipolygon(geom: BaseGeometry) -> GEOSGeometry:
+    """Convert Shapely geometry to Django GEOSGeometry MultiPolygon with SRID=0."""
+    # Ensure it's a MultiPolygon
+    if geom.geom_type == "Polygon":
+        geom = MultiPolygon([geom])
+    elif geom.geom_type != "MultiPolygon":
+        raise ValueError(f"Expected Polygon or MultiPolygon, got {geom.geom_type}")
+
     wkt = shapely_wkt.dumps(geom)
-    # Create Django Polygon from WKT with SRID=0 (image coordinates)
+    # Create Django MultiPolygon from WKT with SRID=0 (image coordinates)
     django_geom = GEOSGeometry(wkt, srid=0)
     return django_geom
 
 
-def create_collapse_from_geom(
-    image: Image,
-    geom: BaseGeometry,
-    area: float | None = None,
-    volume: float | None = None,
-) -> Collapse:
-    """Create a Collapse instance using Django ORM. Returns created Collapse instance."""
-    # Convert Shapely geometry to Django GEOSGeometry
-    django_geom = shapely_to_django_polygon(geom)
-
-    # Create Collapse instance
-    collapse = Collapse(
-        image=image,
-        geom=django_geom,
-        area=float(area) if area is not None else None,
-        volume=float(volume) if volume is not None else None,
-    )
-    collapse.save()
-
-    return collapse
-
-
 def read_collapse_volume_file(path: Path) -> pd.DataFrame:
-    import re
+    """
+    Read collapse volume file with format:
+    year month day_before_collapse day_after_collapse collapse_type volume
 
-    # regex: 6 mandatory columns then optional trailing flag that starts with %
-    # allow numeric type or literal "NaN" for missing type
+    Returns DataFrame with date_after as the primary date field.
+    """
     pattern = re.compile(
         r"^\s*(\d{4})\s+(\d{1,2})\s+(\d{1,2})\s+(\d{1,2})\s+((?:\d+|NaN))\s+(\d+)(?:\s+(%.*))?\s*$",
         re.IGNORECASE,
     )
     rows = []
+
     for ln in path.read_text(encoding="utf-8").splitlines():
+        # Skip empty lines and comments
         if not ln.strip() or ln.lstrip().startswith("%"):
             continue
-        m = pattern.match(ln)
-        if m:
-            year, month, day_start, day_end, typ, size, flag = m.groups()
-        else:
-            parts = ln.split()
-            if len(parts) < 6:
-                raise ValueError(f"Unparseable line: {ln!r}")
-            year, month, day_start, day_end, typ, size = parts[:6]
-            flag = None
-            if len(parts) > 6:
-                tail = " ".join(parts[6:])
-                flag = tail if tail.startswith("%") else None
 
-        # normalize type: treat NaN (any case) as missing -> None
+        m = pattern.match(ln)
+        if not m:
+            logger.warning(f"Unparseable line: {ln!r}")
+            continue
+
+        year, month, day_before, day_after, typ, volume, flag = m.groups()
+
+        # Parse type: treat NaN (any case) as missing -> None
         typ_val = None if isinstance(typ, str) and typ.lower() == "nan" else int(typ)
+
+        # Handle month overflow (e.g., September 31 -> October 1)
+        try:
+            date_after = pd.to_datetime(
+                f"{year}-{int(month):02d}-{int(day_after):02d}", format="%Y-%m-%d"
+            )
+        except ValueError:
+            # Invalid date (e.g., Sept 31), adjust to next month
+            month_int = int(month)
+            year_int = int(year)
+            day_after_int = int(day_after)
+
+            if month_int == 12 and day_after_int > 31:
+                # Roll over to next year
+                date_after = pd.to_datetime(
+                    f"{year_int + 1}-01-{day_after_int - 31:02d}"
+                )
+            else:
+                # Roll over to next month
+                days_in_month = pd.Period(f"{year_int}-{month_int:02d}").days_in_month
+                overflow_days = day_after_int - days_in_month
+                date_after = pd.to_datetime(
+                    f"{year_int}-{month_int + 1:02d}-{overflow_days:02d}"
+                )
+            logger.debug(
+                f"Adjusted invalid date {year}-{month}-{day_after} to {date_after.date()}"
+            )
 
         rows.append(
             {
-                "date": pd.to_datetime(
-                    f"{year}-{int(month):02d}-{int(day_end):02d}", format="%Y-%m-%d"
-                ),
+                "date_after": date_after,
                 "year": int(year),
                 "month": int(month),
-                "day_start": int(day_start),
-                "day_end": int(day_end),
-                "type": typ_val,
-                "volume": int(size),
+                "day_before": int(day_before),
+                "day_after": int(day_after),
+                "collapse_type": typ_val,
+                "volume": int(volume),
                 "flag_raw": flag,
             }
         )
@@ -126,99 +158,158 @@ def read_collapse_volume_file(path: Path) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def parse_shapefile_name(filename: str) -> tuple[pd.Timestamp, int]:
+    """
+    Parse shapefile name to extract date (after collapse) and suffix number.
+
+    Examples:
+        20190701.shp -> (2019-07-01, 1)
+        20190724-2.shp -> (2019-07-24, 2)
+        20190726-3.shp -> (2019-07-26, 3)
+
+    Returns:
+        tuple of (date_after, suffix_number)
+    """
+    stem = Path(filename).stem
+
+    # Check for suffix pattern (e.g., 20190724-2)
+    match = re.match(r"^(\d{8})(?:-(\d+))?$", stem)
+    if not match:
+        raise ValueError(
+            f"Filename {filename} does not match expected format YYYYMMDD or YYYYMMDD-N"
+        )
+
+    date_str, suffix_str = match.groups()
+    date_after = pd.to_datetime(date_str, format="%Y%m%d")
+    suffix = int(suffix_str) if suffix_str else 1
+
+    return date_after, suffix
+
+
 if __name__ == "__main__":
+    # year_dirs = [Path("data/import_test/2019")]
+    # for year_dir in sorted(year_dirs):
+
     for year_dir in sorted(shape_dir.iterdir()):
+        year = year_dir.name
+
         if not year_dir.is_dir():
             continue
-        files = sorted(year_dir.glob(f"*{file_ext}"))
-        logger.info(f"Processing year directory: {year_dir}, found {len(files)} files")
+
+        shape_dir = year_dir / "shapefiles"
+        files = sorted(shape_dir.glob(f"*{file_ext}"))
+        logger.info(f"Processing year {year}, found {len(files)} files")
 
         # Check if a volume file exists
-        year = year_dir.name.split("_")[0]
-        volume_file = volume_file_dir / f"crolli_{year}.txt"
+        volume_file = year_dir / f"volumi_{year}.txt"
         collapse_volume_df = None
+        has_volume_file = False
         if volume_file.exists():
             try:
                 collapse_volume_df = read_collapse_volume_file(volume_file)
+                has_volume_file = True
+                logger.info(
+                    f"Loaded volume file with {len(collapse_volume_df)} entries"
+                )
             except Exception as e:
                 logger.error(f"Error reading volume file {volume_file}: {e}")
-                raise e
-            has_volume_file = True
+                raise
         else:
-            has_volume_file = False
-        if not has_volume_file:
             logger.warning(
-                f"No volume file found for year {year}, proceeding without volume data."
+                f"No volume file found for year {year}, proceeding without volume data"
             )
 
         if not files:
-            logger.warning(f"No shapefiles found in {year_dir}, skipping...")
+            logger.warning(f"No shapefiles found in {shape_dir}, skipping...")
             continue
 
         for file in tqdm(files, desc="Processing shapefiles"):
-            logger.debug(f"Reading {file}...")
-
             # Skip shapefile with _vol in the name (they don't have geometry)
             if "_vol" in file.name:
                 logger.info(f"Skipping {file} (volume shapefile)")
                 continue
 
-            # Extract date from filename
+            # Parse filename to get date (after collapse) and suffix
             try:
-                date_str = file.stem.split("-")[0]
-                date = pd.to_datetime(date_str, format="%Y%m%d").date()
-            except Exception as e:
-                logger.error(f"Error parsing date from {file}: {e}")
-                raise ValueError(
-                    f"Filename {file.name} does not match expected format."
-                ) from e
-                # continue
+                date_after, suffix = parse_shapefile_name(file.name)
+                date_after_date = date_after.date()
+            except ValueError as e:
+                logger.error(f"Error parsing filename {file.name}: {e}")
+                continue
 
-            # Fetch images for the given date using Django ORM, ordered by acquisition time descending
+            logger.debug(
+                f"Processing {file.name}: date_after={date_after_date}, suffix={suffix}"
+            )
+
+            # Fetch image for the date AFTER the collapse
             try:
                 images = Image.objects.filter(
-                    acquisition_timestamp__date=date
+                    acquisition_timestamp__date=date_after_date
                 ).order_by("-acquisition_timestamp")
 
                 if not images.exists():
-                    logger.warning(f"No images found for date {date}, skipping {file}")
+                    logger.warning(
+                        f"No images found for date {date_after_date}, skipping {file.name}"
+                    )
                     continue
 
-                # Pick up center image in the list
+                # Pick middle image from the list
                 idx = len(images) // 2
                 image = images[idx]
                 logger.debug(
                     f"Selected image ID: {image.id} - {image.acquisition_timestamp}"
                 )
             except Exception as e:
-                logger.error(f"Error fetching images for {file}: {e}")
+                logger.error(f"Error fetching images for {file.name}: {e}")
                 continue
 
-            # Read geometry from file
+            # Read ALL geometries from shapefile (multiple polygons merged into MultiPolygon)
             try:
-                geom = read_shapely_geom_from_file(file, invert_y=True)
+                geom = read_all_geometries_from_file(file, invert_y=True)
             except Exception as e:
-                logger.error(f"Error reading {file}: {e}")
+                logger.error(f"Error reading geometries from {file.name}: {e}")
                 continue
 
-            # Get volume from collapse_volume_df if available
+            # Get volume from volume file (only for primary collapse, suffix=1)
             volume = None
-            if has_volume_file and collapse_volume_df is not None:
+            if has_volume_file and collapse_volume_df is not None and suffix == 1:
                 match = collapse_volume_df.loc[
-                    (collapse_volume_df["date"].dt.date == date)
+                    collapse_volume_df["date_after"].dt.date == date_after_date
                 ]
                 if not match.empty:
                     volume = float(match.iloc[0]["volume"])
-                    logger.debug(f"Found volume {volume} for date {date}")
+                    logger.debug(f"Found volume {volume} m³ for date {date_after_date}")
                 else:
-                    logger.debug(f"No volume entry found for date {date}")
+                    logger.debug(f"No volume entry found for date {date_after_date}")
+            elif suffix > 1:
+                logger.debug(f"Suffix={suffix}, volume set to NaN (secondary collapse)")
+                volume = np.nan
 
-            # Insert geometry into DB using Django ORM
+            # Calculate area
             area = np.round(geom.area, 5)
-            collapse = create_collapse_from_geom(
+
+            # Convert Shapely geometry to Django GEOSGeometry MultiPolygon
+            django_geom = shapely_to_django_multipolygon(geom)
+
+            # Create Collapse instance
+            collapse = Collapse(
                 image=image,
-                geom=geom,
-                area=area,
-                volume=volume,
+                date=date_after_date,  # Date AFTER collapse (mandatory field)
+                geom=django_geom,
+                area=float(area) if area is not None else None,
+                volume=float(volume)
+                if volume is not None and not np.isnan(volume)
+                else None,
             )
+
+            try:
+                collapse.save()
+                logger.info(
+                    f"✓ Inserted collapse id={collapse.id}, date={date_after_date}, "
+                    f"suffix={suffix}, polygons={len(geom.geoms)}, "
+                    f"area={area:.1f} px², volume={volume if volume else 'N/A'}"
+                )
+            except Exception as e:
+                logger.error(f"Error saving collapse for {file.name}: {e}")
+                continue
             logger.debug(f"Inserted collapse id: {collapse.id}")

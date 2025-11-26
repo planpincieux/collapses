@@ -13,8 +13,8 @@ from shapely.ops import transform
 from tqdm import tqdm
 
 from ppcollapse import logger
+from ppcollapse.setup_django_ppcx import setup_django
 from ppcollapse.utils.config import ConfigManager
-from setup_django_ppcx import get_django_app_dir, setup_django
 
 shape_dir = Path("data/import")
 file_ext = ".shp"
@@ -23,7 +23,7 @@ file_ext = ".shp"
 config = ConfigManager(config_path="config.yaml")
 
 # Configure Django settings before any Django imports
-setup_django(django_app_dir=get_django_app_dir(), db_config=config.get("database"))
+setup_django(db_config=config.get("database"))
 
 # Import Django models after setting up Django using importlib
 ppcx_app_models = importlib.import_module("ppcx_app.models")

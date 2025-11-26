@@ -8,7 +8,6 @@ Python scripts that need access to Django models and ORM functionality.
 import os
 import sys
 from pathlib import Path
-from typing import Optional
 
 from django.apps import apps as django_apps
 
@@ -16,9 +15,9 @@ PPCX_APP_DIR = Path("/home/francesco/dati/ppcx/ppcx-app")
 
 
 def setup_django(
-    django_app_dir: Optional[Path] = None,
+    django_app_dir: Path | None = None,
     settings_module: str = "planpincieux.settings",
-    db_config: Optional[dict] = None,
+    db_config: dict | None = None,
 ) -> None:
     """
     Configure and initialize Django for standalone script execution.
@@ -57,9 +56,8 @@ def setup_django(
 
     # Check if Django is already configured
     if django_apps.ready:
-        raise RuntimeError(
-            "Django is already configured. setup_django() should only be called once."
-        )
+        print("Django is already configured. Skipping setup_django().")
+        return
 
     # Set default Django app directory if not provided
     if django_app_dir is None:
@@ -92,13 +90,3 @@ def setup_django(
 
     # Initialize Django
     django.setup()
-
-
-def get_django_app_dir() -> Path:
-    """
-    Get the default Django app directory path.
-
-    Returns:
-        Path object pointing to the Django app directory
-    """
-    return Path(PPCX_APP_DIR) / "app"

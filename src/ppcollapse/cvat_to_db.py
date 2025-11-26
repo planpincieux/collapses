@@ -2,7 +2,6 @@ import importlib
 import os
 from pathlib import Path
 
-# Import the new CVAT module
 from cvatkit import CvatReader
 from django.contrib.gis.geos import GEOSGeometry
 from django.contrib.gis.geos import MultiPolygon as GEOSMultiPolygon
@@ -13,8 +12,8 @@ from shapely.geometry import Polygon as ShpPolygon
 from sqlalchemy import create_engine
 
 from ppcollapse import setup_logger
-from ppcollapse.utils.config import ConfigManager
 from ppcollapse.setup_django_ppcx import setup_django
+from ppcollapse.utils.config import ConfigManager
 
 # Allow Django ORM to work in Jupyter's async environment
 os.environ["DJANGO_ALLOW_ASYNC_UNSAFE"] = "true"

@@ -254,6 +254,15 @@ def get_dic_data(
     Fetch DIC displacement data from the Django API endpoint as a DataFrame.
 
     Provide either app_host/app_port explicitly or a ConfigManager (config) containing api.host/api.port.
+
+    Args:
+        dic_id: DIC analysis ID
+        app_host: API host (optional, defaults to config)
+        app_port: API port (optional, defaults to config)
+        config: ConfigManager (optional, used if app_host/app_port not provided)
+    Returns:
+        DataFrame with columns [x, y, u, v, V]
+
     """
     host, port = _resolve_api_host_port(app_host, app_port, config)
     url = f"http://{host}:{port}/API/dic/{dic_id}/"
@@ -317,6 +326,7 @@ def get_multi_dic_data(
         dic_ids: List of DIC analysis IDs
         app_host: API host (optional, defaults to config)
         app_port: API port (optional, defaults to config)
+        config: ConfigManager (optional, used if app_host/app_port not provided)
 
     Returns:
         DataFrame or dict: Concatenated DataFrame with all DIC data if stack_results is True, otherwise a dictionary of DataFrames.

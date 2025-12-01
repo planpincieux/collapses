@@ -45,6 +45,7 @@ MIN_COLLAPSE_AREA = 150000  # px²
 DAYS_BEFORE = 10
 DAY_AFTER = 5
 MIN_DIC_DAYS_BEFORE = 5  # Minimum number of DIC analyses before collapse
+USE_CENTER_DATE = True  # Use center date between master/slave for plotting
 
 MIN_VELOCITY = 1  # Minimum velocity threshold (px/day)
 OUTLIER_THRESHOLD = 2.5  # NMAD threshold for outlier removal
@@ -56,7 +57,7 @@ LOWESS_FRAC = 0.2
 # LOWESS_FRAC = 0.4  # Less smoothing (smaller window)
 VELOCITY_YLIM = (0, 20)  # fixed y axis limits for velocity plot, or None
 
-N_JOBS = 10  # number of parallel jobs
+N_JOBS = 16  # number of parallel jobs
 
 # -------------------------
 
@@ -482,6 +483,7 @@ def compute_deviation_scores_timeseries(
     dic_data: dict,
     min_velocity: float = MIN_VELOCITY,
     outlier_threshold: float = OUTLIER_THRESHOLD,
+    use_center_date: bool = True,
 ) -> pd.DataFrame:
     """
     Compute deviation scores per timestamp.
@@ -502,9 +504,25 @@ def compute_deviation_scores_timeseries(
         if pts is None or pts.empty:
             continue
 
-        date_val = pd.to_datetime(
-            dic_metadata.loc[dic_metadata.dic_id == dic_id, "reference_date"].values[0]
-        )
+        if not use_center_date:
+            date_val = pd.to_datetime(
+                dic_metadata.loc[
+                    dic_metadata.dic_id == dic_id, "reference_date"
+                ].values[0]
+            )
+        else:
+            # Use center date between slave and master images as timestamp
+            master_date = pd.to_datetime(
+                dic_metadata.loc[
+                    dic_metadata.dic_id == dic_id, "master_timestamp"
+                ].values[0]
+            )
+            slave_date = pd.to_datetime(
+                dic_metadata.loc[
+                    dic_metadata.dic_id == dic_id, "slave_timestamp"
+                ].values[0]
+            )
+            date_val = master_date + (slave_date - master_date) / 2
 
         # Extract and filter points
         pts_inside = extract_and_filter_points(
@@ -580,7 +598,6 @@ def make_collapse_plot(
     *,
     velocity_ylim: tuple[int, int] | None = VELOCITY_YLIM,
     trend_method: str = ROBUST_METHOD,
-    idx_dic_before: int = -1,
     deviation_score_before_collapse: float | None = None,
 ) -> tuple[Figure, Any]:
     """Create the three-panel (image + quiver + timeseries) plot for a collapse.
@@ -623,11 +640,12 @@ def make_collapse_plot(
 
     # Middle: quiver plot with proper implementation
     try:
-        # take second last, as last may be on collapse date
-        last_dic_id = dic_metadata.iloc[idx_dic_before]["dic_id"]
-        last_dic_date = dic_metadata.iloc[idx_dic_before]["reference_date"]
+        # take the dic on the collapse date
+        idx_dic = dic_metadata[dic_metadata["reference_date"] == date_ts][
+            "dic_id"
+        ].values[0]
         dic_pts = get_dic_data(
-            dic_id=last_dic_id,
+            dic_id=idx_dic,
             config=ConfigManager(CONFIG_PATH),
         )
         ax_quiver.imshow(image, alpha=0.7)
@@ -652,9 +670,12 @@ def make_collapse_plot(
         )
         cbar = fig.colorbar(q, ax=ax_quiver, pad=0.01, fraction=0.046)
         cbar.ax.tick_params(labelsize=8)
-        if pd.notna(last_dic_date):
-            date_str = pd.to_datetime(last_dic_date).strftime("%Y-%m-%d")
-            ax_quiver.set_title(f"DIC Velocity Field ({date_str})", fontsize=10, pad=5)
+        if pd.notna(date_ts):
+            ax_quiver.set_title(
+                f"DIC Velocity Field ({date_ts.strftime('%Y-%m-%d')})",
+                fontsize=10,
+                pad=5,
+            )
         ax_quiver.set_axis_off()
     except Exception:
         logger.warning(
@@ -721,6 +742,15 @@ def make_collapse_plot(
                 color="C1",
                 label="±1 std",
             )
+
+        # mark collapse date with vertical line
+        ax_ts.axvline(
+            x=date_ts,
+            color="black",
+            linestyle=":",
+            linewidth=1.5,
+            label="Collapse date",
+        )
 
         # Deviation score on twin axis
         if not deviation_df.empty:
@@ -800,6 +830,7 @@ def process_collapse(
     velocity_trend_method: str = ROBUST_METHOD,
     buffer_distance: float = BUFFER_DISTANCE_PX,
     min_dic_days_before: int = 5,
+    use_center_date: bool = True,
 ) -> bool:
     """
     Make the two-panel plot (image + geometry on left, velocity timeseries on right)
@@ -894,16 +925,25 @@ def process_collapse(
         if pts_filtered.empty:
             continue
 
-        # Use center date between slave and master images as timestamp
-        master_date = pd.to_datetime(
-            dic_metadata.loc[dic_metadata.dic_id == dic_id, "master_timestamp"].values[
-                0
-            ]
-        )
-        slave_date = pd.to_datetime(
-            dic_metadata.loc[dic_metadata.dic_id == dic_id, "slave_timestamp"].values[0]
-        )
-        date = master_date + (slave_date - master_date) / 2
+        if not use_center_date:
+            date = pd.to_datetime(
+                dic_metadata.loc[
+                    dic_metadata.dic_id == dic_id, "reference_date"
+                ].values[0]
+            )
+        else:
+            # Use center date between slave and master images as timestamp
+            master_date = pd.to_datetime(
+                dic_metadata.loc[
+                    dic_metadata.dic_id == dic_id, "master_timestamp"
+                ].values[0]
+            )
+            slave_date = pd.to_datetime(
+                dic_metadata.loc[
+                    dic_metadata.dic_id == dic_id, "slave_timestamp"
+                ].values[0]
+            )
+            date = master_date + (slave_date - master_date) / 2
         pts_filtered["date"] = pd.to_datetime(date)
         all_inside_points.append(pts_filtered)
 
@@ -925,6 +965,7 @@ def process_collapse(
             dic_data=dic_data,
             min_velocity=MIN_VELOCITY,
             outlier_threshold=OUTLIER_THRESHOLD,
+            use_center_date=use_center_date,
         )
 
         # Get deviation score from second-to-last timestamp (before collapse)
@@ -1021,6 +1062,7 @@ if __name__ == "__main__":
                 velocity_trend_method=ROBUST_METHOD,
                 buffer_distance=BUFFER_DISTANCE_PX,
                 min_dic_days_before=MIN_DIC_DAYS_BEFORE,
+                use_center_date=USE_CENTER_DATE,
             )
         except Exception:
             logger.exception(

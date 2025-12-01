@@ -9,8 +9,6 @@ import os
 import sys
 from pathlib import Path
 
-from django.apps import apps as django_apps
-
 PPCX_APP_DIR = Path("/home/francesco/dati/ppcx/ppcx-app")
 
 
@@ -52,7 +50,9 @@ def setup_django(
         >>> # Now you can import Django models
         >>> from ppcx_app.models import Collapse, Image
     """
+
     import django
+    from django.apps import apps as django_apps
 
     # Check if Django is already configured
     if django_apps.ready:
@@ -90,3 +90,12 @@ def setup_django(
 
     # Initialize Django
     django.setup()
+
+
+if __name__ == "__main__":
+    setup_django()
+    # Get all registered models
+    models = django_apps.get_models()
+    print("Django setup successful. Available models:")
+    for model in models:
+        print(f"- {model.__name__}")
